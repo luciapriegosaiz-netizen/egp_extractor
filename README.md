@@ -4,7 +4,7 @@ Convierte cualquier proyecto SAS Enterprise Guide (`.egp`) en archivos `.txt`
 organizados por flujo. Cada archivo contiene el código SAS y el log de ejecución
 de cada nodo intercalados, listos para usarse como entrada al generador de notebooks CP4D.
 
-**Sin instalaciones extra. Sin credenciales. Solo Python (ya disponible con CP4D).**
+**Sin instalaciones extra. Sin credenciales. Solo Python.**
 
 ---
 
