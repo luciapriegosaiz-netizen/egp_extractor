@@ -250,12 +250,28 @@ def extraer_proyecto(input_path, output_dir=None, include_logs=False):
     #
     resumen = []
 
-    for container_id, flow_name in sorted(flows.items(), key=lambda x: x[1]):
-        safe_name  = safe_filename(flow_name)
+    # Ordenar por número del flujo SAS (extraer número de "N.Nombre" o "Nb.Nombre")
+    def flujo_sort_key(item):
+        flow_name = item[1]
+        # Extraer número: "0.Identificacion" → 0, "3b.Interconsultas" → 3.5, "11.Hemorragias" → 11
+        match = re.match(r'(\d+)([a-z]?)', flow_name)
+        if match:
+            num = int(match.group(1))
+            suffix = 0.5 if match.group(2) else 0  # Flujos con sufijo (3b) van después del número (3)
+            return (num + suffix, flow_name)
+        return (float('inf'), flow_name)
+    
+    for flujo_num, (container_id, flow_name) in enumerate(sorted(flows.items(), key=flujo_sort_key)):
+        # Extraer solo la parte descriptiva del nombre (sin el número inicial)
+        # "0.Identificacion_cohorte" → "Identificacion_cohorte"
+        # "3b.Interconsultas_AP" → "Interconsultas_AP"
+        desc_match = re.match(r'\d+[a-z]?\.(.+)', flow_name)
+        desc_name = desc_match.group(1) if desc_match else flow_name
+        safe_name  = safe_filename(desc_name)
         nodos      = flow_nodos.get(container_id, [])
         n_con_log  = 0
 
-        out_path = output_dir / f"{safe_name}.txt"
+        out_path = output_dir / f"flujo{flujo_num}_{safe_name}.txt"
 
         with open(out_path, 'w', encoding='utf-8') as f:
             f.write(f"/* {'='*56}\n")
