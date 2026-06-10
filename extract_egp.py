@@ -21,7 +21,7 @@ Uso:
     python extract_egp.py carpeta_ya_descomprimida --logs
 """
 
-import sys, re, json, zipfile, shutil, argparse
+import sys, re, json, zipfile, shutil, argparse, html
 from collections import defaultdict, deque
 from pathlib import Path
 
@@ -68,7 +68,7 @@ def codigo_limpio(bloque):
     code = inner(bloque, 'TaskCode')
     if not code:
         code = inner(bloque, 'Text')
-    return code.strip()
+    return html.unescape(code).strip()
 
 
 def safe_filename(nombre):
@@ -256,8 +256,102 @@ def ordenar_nodos_dfs(nodos_con_datos, log_index=None):
 
 
 # ============================================================
-# PROCESO PRINCIPAL
+# DEPENDENCIAS GLOBALES — TABLAS A GUARDAR COMO CSV
 # ============================================================
+
+def calcular_dependencias_globales(flujos_ordenados, flow_nodos, log_index):
+    """
+    Pre-calcula para cada flujo qué tablas WORK deben guardarse como CSV.
+
+    Regla:
+      a_guardar = hojas ∪ promovidas
+
+      hojas     = tablas producidas en el flujo que NINGÚN nodo del mismo flujo
+                  consume (son el output final del flujo).
+
+      promovidas = tablas producidas Y consumidas dentro del mismo flujo
+                  (intermedias) que algún flujo POSTERIOR también necesita
+                  como input. Se guardan para que el flujo posterior las cargue.
+
+    Sin --logs, los outputs de ImportTask no se detectan del código SAS
+    (no tienen CREATE TABLE); el resultado es de "mejor esfuerzo".
+
+    Parámetros
+    ----------
+    flujos_ordenados : list of (flujo_num, container_id, flow_name) — en orden ejecución
+    flow_nodos       : {container_id: [(label, codigo, task_id)]}
+    log_index        : {task_id: Path} — para detección de outputs de ImportTask
+
+    Retorna
+    -------
+    dict listo para serializar a _dependencias_globales.json
+    """
+    # Caché de logs para no releer el mismo archivo varias veces
+    logs_cache = {}
+    for task_id, log_path in log_index.items():
+        try:
+            logs_cache[task_id] = log_path.read_text(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+
+    # Paso 1: tablas producidas y consumidas por cada flujo
+    flujo_producidas = {}   # flujo_num -> set[str upper]
+    flujo_consumidas = {}   # flujo_num -> set[str upper]
+
+    for flujo_num, container_id, _ in flujos_ordenados:
+        nodos = flow_nodos.get(container_id, [])
+        producidas: set = set()
+        consumidas: set = set()
+        for _, codigo, task_id in nodos:
+            log_raw = logs_cache.get(task_id, '')
+            for t in extraer_tablas_salida_nodo(codigo, log_raw):
+                producidas.add(t)           # ya viene en MAYÚSCULAS de la función
+            for t in extraer_tablas_consumidas_nodo(codigo):
+                consumidas.add(t)           # idem
+        flujo_producidas[flujo_num] = producidas
+        flujo_consumidas[flujo_num] = consumidas
+
+    # Paso 2: para cada flujo, unión de tablas consumidas por todos los flujos POSTERIORES
+    all_nums = [fn for fn, _, _ in flujos_ordenados]
+    consumidas_por_posteriores: dict = {}
+    for i, fn in enumerate(all_nums):
+        union: set = set()
+        for j in range(i + 1, len(all_nums)):
+            union.update(flujo_consumidas.get(all_nums[j], set()))
+        consumidas_por_posteriores[fn] = union
+
+    # Paso 3: calcular hojas, promovidas y a_guardar por flujo
+    resultado = {}
+
+    for flujo_num, container_id, flow_name in flujos_ordenados:
+        nodos = flow_nodos.get(container_id, [])
+        if not nodos:
+            continue
+
+        producidas  = flujo_producidas[flujo_num]
+        consumidas  = flujo_consumidas[flujo_num]
+
+        # Tablas "hoja": producidas en este flujo que NADIE en este flujo consume
+        hojas       = producidas - consumidas
+
+        # Tablas intermedias: producidas Y consumidas dentro del mismo flujo
+        intermedias = producidas & consumidas
+
+        # Promovidas: intermedias que algún flujo posterior también necesita
+        promovidas  = intermedias & consumidas_por_posteriores[flujo_num]
+
+        a_guardar   = hojas | promovidas
+
+        resultado[str(flujo_num)] = {
+            'nombre'    : flow_name,
+            'a_guardar' : sorted(a_guardar),
+            'hojas'     : sorted(hojas),
+            'promovidas': sorted(promovidas),
+        }
+
+    return resultado
+
+
 
 def extraer_proyecto(input_path, output_dir=None, include_logs=False):
     input_path = Path(input_path).resolve()
@@ -453,21 +547,18 @@ def extraer_proyecto(input_path, output_dir=None, include_logs=False):
 
     # --- 8. Escribir UN .txt por flujo ---
     #
-    # Estructura del archivo:
+    # flujos_ordenados se materializa aquí para reutilizarlo en el paso 10
+    # (cálculo de dependencias globales) sin necesidad de reordenar de nuevo.
     #
-    #   /* FLUJO: nombre | Container: ID | Nodos: N */
-    #
-    #   /* ===== NODO 1: label [task_id] ===== */
-    #
-    #   /* --- CÓDIGO --- */
-    #   <codigo SAS>
-    #
-    #   /* --- LOG --- */          (solo si --logs y existe result.log)
-    #   <contenido del log>
-    #
+    flujos_ordenados = [
+        (flujo_num, container_id, flow_name)
+        for flujo_num, (container_id, flow_name)
+        in enumerate(sorted(flows.items(), key=sort_key))
+    ]
+
     resumen = []
 
-    for flujo_num, (container_id, flow_name) in enumerate(sorted(flows.items(), key=sort_key)):
+    for flujo_num, container_id, flow_name in flujos_ordenados:
         # Extraer solo la parte descriptiva del nombre (sin el número inicial)
         # "0.Identificacion_cohorte" → "Identificacion_cohorte"
         # "3b.Interconsultas_AP" → "Interconsultas_AP"
@@ -546,6 +637,20 @@ def extraer_proyecto(input_path, output_dir=None, include_logs=False):
     summary_path = output_dir / '_summary.json'
     with open(summary_path, 'w', encoding='utf-8') as f:
         json.dump(resumen, f, ensure_ascii=False, indent=2)
+
+    # --- 10. Dependencias globales JSON ---
+    #
+    # Pre-calcula qué tablas WORK debe guardar cada flujo como CSV.
+    # generate_notebook_v3.py lo lee directamente si existe, evitando
+    # releer todos los .txt para calcularlo en tiempo real.
+    #
+    print("Calculando dependencias globales entre flujos...")
+    dependencias = calcular_dependencias_globales(flujos_ordenados, flow_nodos, log_index)
+    dep_path = output_dir / '_dependencias_globales.json'
+    with open(dep_path, 'w', encoding='utf-8') as f:
+        json.dump(dependencias, f, ensure_ascii=False, indent=2)
+    total_tablas = sum(len(v['a_guardar']) for v in dependencias.values())
+    print(f"  _dependencias_globales.json: {len(dependencias)} flujos, {total_tablas} tablas a guardar")
 
     print(f"\n{'='*60}")
     print(f"  RESUMEN FINAL")
