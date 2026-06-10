@@ -1,4 +1,4 @@
-# Extractor de proyectos SAS Enterprise Guide (`extract_egp`)
+# Extractor SAS EG — Guía de uso
 
 Herramienta de línea de comandos que convierte un proyecto SAS Enterprise Guide
 (`.egp`) en una colección de archivos `.txt` organizados por flujo, listos para
